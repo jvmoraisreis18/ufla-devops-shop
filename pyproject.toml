@@ -19,6 +19,7 @@ addopts = "-q"
 
 [tool.coverage.run]
 source = ["app"]
+relative_files = true
 
 [tool.coverage.report]
 show_missing = true

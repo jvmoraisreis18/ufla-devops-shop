@@ -1,0 +1,80 @@
+name: Trivy vulnerability scan
+description: Relatorio completo e bloqueio de HIGH/CRITICAL com correcao disponivel.
+inputs:
+  scan-type:
+    description: Tipo de analise (fs ou image).
+    required: true
+  target:
+    description: Diretorio com requirements.txt ou arquivo Docker exportado.
+    required: true
+  report-name:
+    description: Nome do artifact de relatorios.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Instalar Trivy 0.76.1
+      shell: bash
+      run: |
+        set -euo pipefail
+        install_dir="$RUNNER_TEMP/trivy-bin"
+        mkdir -p "$install_dir"
+        curl --fail --silent --show-error --location \
+          https://github.com/aquasecurity/trivy/releases/download/v0.76.1/trivy_0.76.1_Linux-64bit.tar.gz \
+          --output "$install_dir/trivy.tar.gz"
+        echo "c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0  $install_dir/trivy.tar.gz" | sha256sum --check
+        tar -xzf "$install_dir/trivy.tar.gz" -C "$install_dir" trivy
+        echo "$install_dir" >> "$GITHUB_PATH"
+        "$install_dir/trivy" --version
+
+    - name: Gerar relatorio completo de vulnerabilidades
+      shell: bash
+      env:
+        SCAN_TYPE: ${{ inputs.scan-type }}
+        SCAN_TARGET: ${{ inputs.target }}
+        REPORT_NAME: ${{ inputs.report-name }}
+      run: |
+        set -euo pipefail
+        report_dir="$RUNNER_TEMP/$REPORT_NAME"
+        mkdir -p "$report_dir"
+        case "$SCAN_TYPE" in
+          fs) test -s "$SCAN_TARGET/requirements.txt"; target_args=("$SCAN_TARGET") ;;
+          image) test -s "$SCAN_TARGET"; target_args=(--input "$SCAN_TARGET") ;;
+          *) echo "Tipo de analise invalido"; exit 1 ;;
+        esac
+        # Exit code 0 se houver CVEs; erros operacionais continuam causando falha.
+        trivy "$SCAN_TYPE" --cache-dir "$RUNNER_TEMP/trivy-cache" \
+          --scanners vuln --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
+          --ignore-unfixed=false --exit-code 0 --timeout 10m --no-progress \
+          --format json --output "$report_dir/vulnerabilities.json" \
+          "${target_args[@]}" 2>&1 | tee "$report_dir/scan.log"
+        cp "$RUNNER_TEMP/trivy-cache/db/metadata.json" "$report_dir/db-metadata.json"
+
+    - name: Bloquear HIGH e CRITICAL com correcao
+      shell: bash
+      env:
+        SCAN_TYPE: ${{ inputs.scan-type }}
+        SCAN_TARGET: ${{ inputs.target }}
+        REPORT_NAME: ${{ inputs.report-name }}
+      run: |
+        set -euo pipefail
+        case "$SCAN_TYPE" in
+          fs) target_args=("$SCAN_TARGET") ;;
+          image) target_args=(--input "$SCAN_TARGET") ;;
+          *) echo "Tipo de analise invalido"; exit 1 ;;
+        esac
+        # Reutiliza a base atualizada e a imagem; nao reconstrui nem publica.
+        trivy "$SCAN_TYPE" --cache-dir "$RUNNER_TEMP/trivy-cache" \
+          --skip-db-update --scanners vuln --severity HIGH,CRITICAL \
+          --ignore-unfixed --exit-code 1 --timeout 10m --no-progress \
+          --format table --output "$RUNNER_TEMP/$REPORT_NAME/blocking.txt" \
+          "${target_args[@]}" 2>&1 | tee "$RUNNER_TEMP/$REPORT_NAME/gate.log"
+
+    - name: Publicar relatorios do Trivy
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.report-name }}
+        path: ${{ runner.temp }}/${{ inputs.report-name }}/
+        if-no-files-found: error
+        retention-days: 7

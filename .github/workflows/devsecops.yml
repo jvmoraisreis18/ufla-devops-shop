@@ -1,0 +1,209 @@
+name: DevSecOps CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: Gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do historico completo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Instalar Gitleaks 8.30.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          install_dir="$RUNNER_TEMP/gitleaks"
+          mkdir -p "$install_dir"
+          curl --fail --silent --show-error --location \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            --output "$install_dir/gitleaks.tar.gz"
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $install_dir/gitleaks.tar.gz" | sha256sum --check
+          tar -xzf "$install_dir/gitleaks.tar.gz" -C "$install_dir" gitleaks
+          echo "$install_dir" >> "$GITHUB_PATH"
+          "$install_dir/gitleaks" version
+
+      - name: Verificar segredos no historico Git
+        shell: bash
+        run: |
+          gitleaks git . \
+            --log-opts="--all" \
+            --redact=100 \
+            --no-banner \
+            --log-level=error \
+            --exit-code=1 \
+            --report-format=json \
+            --report-path="$RUNNER_TEMP/gitleaks-raw.json" \
+            > "$RUNNER_TEMP/gitleaks-scan.log" 2>&1
+
+      - name: Preparar relatorio sem valores sensiveis
+        if: always()
+        shell: python
+        run: |
+          import json
+          import os
+          from pathlib import Path
+
+          temp = Path(os.environ["RUNNER_TEMP"])
+          source = temp / "gitleaks-raw.json"
+          output = temp / "gitleaks-report.json"
+          if not source.is_file():
+              output.write_text(json.dumps({"status": "report_unavailable", "findings": []}))
+              raise SystemExit("Gitleaks nao produziu relatorio; consulte o status dos passos anteriores.")
+
+          findings = json.loads(source.read_text())
+          fields = ("RuleID", "File", "StartLine", "EndLine", "Commit")
+          safe_findings = [{key: item[key] for key in fields} for item in findings]
+          output.write_text(json.dumps({"version": "8.30.1", "findings": safe_findings}, indent=2))
+          print(f"Gitleaks: {len(safe_findings)} achado(s). Detalhes sem valores no artifact.")
+
+      - name: Publicar relatorio do Gitleaks
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: ${{ runner.temp }}/gitleaks-report.json
+          if-no-files-found: error
+          retention-days: 7
+
+  ci:
+    name: Ruff e pytest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar dependencias
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Executar Ruff
+        run: ruff check .
+
+      - name: Executar testes com cobertura
+        run: pytest --cov=app --cov-report=term --cov-report=xml
+
+      - name: Publicar cobertura para analise
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-coverage
+          path: coverage.xml
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Registrar dependencias instaladas para o Trivy
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/project-dependencies"
+          python -m pip freeze --all > "$RUNNER_TEMP/project-dependencies/requirements.txt"
+
+      - name: Publicar inventario de dependencias
+        uses: actions/upload-artifact@v4
+        with:
+          name: resolved-python-dependencies
+          path: ${{ runner.temp }}/project-dependencies/requirements.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  sonarqube:
+    name: SonarQube Cloud e Quality Gate
+    needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout do historico completo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Obter cobertura do CI
+        uses: actions/download-artifact@v4
+        with:
+          name: python-coverage
+
+      - name: Validar disponibilidade do token e da cobertura
+        shell: bash
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          if [ -z "$SONAR_TOKEN" ]; then
+            echo "::error::SONAR_TOKEN indisponivel. A analise obrigatoria nao pode ser executada."
+            exit 1
+          fi
+          test -s coverage.xml
+
+      - name: Analisar codigo e aguardar Quality Gate
+        uses: SonarSource/sonarqube-scan-action@v8.4.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  trivy-dependencies:
+    name: Trivy - dependencias do projeto
+    needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout do repositorio
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Obter dependencias resolvidas pelo CI
+        uses: actions/download-artifact@v4
+        with:
+          name: resolved-python-dependencies
+          path: ${{ runner.temp }}/project-dependencies
+
+      - name: Analisar dependencias e aplicar bloqueio
+        uses: ./.github/actions/trivy
+        with:
+          scan-type: fs
+          target: ${{ runner.temp }}/project-dependencies
+          report-name: trivy-dependencies
+
+  trivy-image:
+    name: Trivy e Syft - imagem candidata
+    needs: [ci, gitleaks]
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout do repositorio
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Construir e exportar imagem candidata sem publicar
+        id: candidate-image
+        shell: bash
+        run: |
+          docker build --pull --tag "ufla-shop:candidate-$GITHUB_SHA" .
+          docker save --output "$RUNNER_TEMP/candidate-image.tar" "ufla-shop:candidate-$GITHUB_SHA"
+
+      - name: Analisar imagem e aplicar bloqueio
+        uses: ./.github/actions/trivy
+        with:
+          scan-type: image
+          target: ${{ runner.temp }}/candidate-image.tar
+          report-name: trivy-image
+
+      - name: Gerar e validar SBOM da mesma imagem candidata
+        if: ${{ !cancelled() && steps.candidate-image.outcome == 'success' }}
+        uses: ./.github/actions/syft
+        with:
+          image-archive: ${{ runner.temp }}/candidate-image.tar
+          artifact-name: sbom-cyclonedx-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
