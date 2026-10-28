@@ -1,0 +1,61 @@
+name: Syft CycloneDX SBOM
+description: Gera e valida o SBOM da imagem candidata exportada, sem reconstruir ou publicar.
+inputs:
+  image-archive:
+    description: Mesmo arquivo Docker exportado analisado pelo Trivy.
+    required: true
+  artifact-name:
+    description: Nome do artifact com commit e identificacao da execucao.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Instalar Syft 1.55.0
+      shell: bash
+      run: |
+        set -euo pipefail
+        install_dir="$RUNNER_TEMP/syft-bin"
+        mkdir -p "$install_dir"
+        curl --fail --silent --show-error --location \
+          https://github.com/anchore/syft/releases/download/v1.55.0/syft_1.55.0_linux_amd64.tar.gz \
+          --output "$install_dir/syft.tar.gz"
+        echo "bb65249542db5fedeeb4d3f9b018b75e7264dbfbbb10486f044581a92f90490d  $install_dir/syft.tar.gz" | sha256sum --check
+        tar -xzf "$install_dir/syft.tar.gz" -C "$install_dir" syft
+        echo "$install_dir" >> "$GITHUB_PATH"
+        "$install_dir/syft" version
+
+    - name: Gerar SBOM CycloneDX JSON
+      shell: bash
+      env:
+        IMAGE_ARCHIVE: ${{ inputs.image-archive }}
+        SYFT_CHECK_FOR_APP_UPDATE: 'false'
+        XDG_CACHE_HOME: ${{ runner.temp }}/syft-cache
+      run: |
+        set -euo pipefail
+        mkdir -p "$RUNNER_TEMP/sbom"
+        test -s "$IMAGE_ARCHIVE"
+        syft scan "docker-archive:$IMAGE_ARCHIVE" \
+          --output "cyclonedx-json@1.6=$RUNNER_TEMP/sbom/sbom.cdx.json" \
+          2>&1 | tee "$RUNNER_TEMP/sbom/syft.log"
+
+    - name: Validar estrutura e componentes da aplicacao
+      shell: bash
+      env:
+        IMAGE_ARCHIVE: ${{ inputs.image-archive }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        python3 "$ACTION_PATH/validate_sbom.py" \
+          "$RUNNER_TEMP/sbom/sbom.cdx.json" \
+          --requirements requirements.txt \
+          --image "$IMAGE_ARCHIVE" \
+          --output "$RUNNER_TEMP/sbom/provenance.json"
+
+    - name: Publicar SBOM e metadados
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ runner.temp }}/sbom/
+        if-no-files-found: error
+        retention-days: 7

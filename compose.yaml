@@ -1,0 +1,78 @@
+services:
+  banco:
+    image: postgres:16-alpine
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-loja}
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?defina no .env}
+
+    volumes:
+      - dados_postgres:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  cache:
+    image: redis:7-alpine
+    restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  api:
+    image: ghcr.io/jvmoraisreis18/ufla-shop:1.0.0
+    restart: unless-stopped
+
+    environment:
+      DATABASE_URL: "postgresql://postgres:${POSTGRES_PASSWORD:?defina no .env}@banco:5432/${POSTGRES_DB:-loja}"
+      REDIS_URL: "redis://cache:6379/0"
+
+    depends_on:
+      banco:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+
+    ports:
+      - "80:80"
+
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+
+    depends_on:
+      api:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  dados_postgres:
