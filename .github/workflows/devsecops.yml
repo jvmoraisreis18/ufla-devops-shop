@@ -97,6 +97,9 @@ jobs:
       - name: Executar testes com cobertura
         run: pytest --cov=app --cov-report=term --cov-report=xml
 
+      - name: Verificar integridade e politica de publicacao
+        run: python -m unittest discover -s .github/scripts -p 'test_*.py' -q
+
       - name: Publicar cobertura para analise
         uses: actions/upload-artifact@v4
         with:
@@ -181,6 +184,9 @@ jobs:
     needs: [ci, gitleaks]
     runs-on: ubuntu-latest
     timeout-minutes: 35
+    outputs:
+      manifest-sha256: ${{ steps.bundle.outputs.manifest-sha256 }}
+      artifact-id: ${{ steps.candidate-artifact.outputs.artifact-id }}
     steps:
       - name: Checkout do repositorio
         uses: actions/checkout@v4
@@ -207,3 +213,93 @@ jobs:
         with:
           image-archive: ${{ runner.temp }}/candidate-image.tar
           artifact-name: sbom-cyclonedx-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Preparar candidata aprovada para transferencia
+        id: bundle
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/release-candidate"
+          mv "$RUNNER_TEMP/candidate-image.tar" "$RUNNER_TEMP/release-candidate/candidate-image.tar"
+          cp "$RUNNER_TEMP/trivy-image/vulnerabilities.json" "$RUNNER_TEMP/release-candidate/trivy-image.json"
+          cp "$RUNNER_TEMP/sbom/sbom.cdx.json" "$RUNNER_TEMP/release-candidate/sbom.cdx.json"
+          cp "$RUNNER_TEMP/sbom/provenance.json" "$RUNNER_TEMP/release-candidate/provenance.json"
+          python3 .github/scripts/ghcr_release.py bundle "$RUNNER_TEMP/release-candidate"
+
+      - name: Disponibilizar candidata aprovada
+        id: candidate-artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-candidate-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-candidate/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    name: Publicar imagem aprovada no GHCR
+    needs: [gitleaks, ci, sonarqube, trivy-dependencies, trivy-image]
+    if: >-
+      ${{ !cancelled() &&
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main' &&
+          github.repository == 'jvmoraisreis18/ufla-devops-shop' &&
+          needs.gitleaks.result == 'success' &&
+          needs.ci.result == 'success' &&
+          needs.sonarqube.result == 'success' &&
+          needs.trivy-dependencies.result == 'success' &&
+          needs.trivy-image.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: ghcr-${{ github.repository }}-${{ github.sha }}
+      cancel-in-progress: false
+    env:
+      EXPECTED_MANIFEST_SHA256: ${{ needs.trivy-image.outputs.manifest-sha256 }}
+      CANDIDATE_ARTIFACT_ID: ${{ needs.trivy-image.outputs.artifact-id }}
+      CONTROL_RESULTS: ${{ toJSON(needs) }}
+    steps:
+      - name: Checkout do repositorio
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Definir diretorios de transferencia
+        shell: bash
+        run: |
+          echo "CANDIDATE_DIR=$RUNNER_TEMP/release-candidate" >> "$GITHUB_ENV"
+          echo "PUBLICATION_DIR=$RUNNER_TEMP/publication" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/publication"
+
+      - name: Obter candidata da mesma execucao
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.trivy-image.outputs.artifact-id }}
+          path: ${{ runner.temp }}/release-candidate
+          merge-multiple: true
+
+      - name: Validar integridade e carregar imagem sem reconstruir
+        run: python3 .github/scripts/ghcr_release.py prepare "$CANDIDATE_DIR"
+
+      - name: Autenticar no GHCR
+        uses: docker/login-action@v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publicar tag SHA e verificar digest remoto
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/ghcr_release.py publish "$CANDIDATE_DIR"
+
+      - name: Disponibilizar rastreabilidade da publicacao
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghcr-publication-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/publication/
+          if-no-files-found: error
+          retention-days: 7
